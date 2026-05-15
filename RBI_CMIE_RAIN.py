@@ -2,88 +2,103 @@ import pandas as pd
 import numpy as np
 import os
 import reverse_geocoder as rg
-import matplotlib.pyplot as plt 
-import seaborn as sns
-import pgeocode
-import statistics
-import random
-import math 
-from tqdm.notebook import tqdm
-import geopy
-import pickle
-import re
+from scipy.spatial import cKDTree
+from pathlib import Path
 
-def dict_update(k, val, D):
-    try:
-        t=D[k]
-        if val not in t:
-            
-            t.append(val)
-            D.update({k:t})
-            
-    except:
-        D.update({k:[val]})
+# --- Constants & Setup ---
+RAIN_PATH = Path("DATA/Rain_DATA")
+CMIE_PATH = Path("DATA/CMIE data")
+YEAR_RANGE = range(1993, 2018)
 
-#### Takes a particular year and return the latlong-wise "Rain shock"
-rainyear_D={}
-def lat_long_to_city(lst):
-    results = rg.search(lst, mode=1) # default mode = 2
-    #dict(results[0])['admin1'], dict(results[0])
-    #return results
-    return  dict(results[0])['cc']
-def year_rain(year):
-    Drn1=Dr[[0,1]+list(range(year-21, year))]
-    p=[]
-    sh=[]
-    for row in Drn1.values:
-        std=statistics.stdev(row[2:-1])
-        mn=statistics.mean(row[2:-1])
-
-        if (std+mn)>row[-1]>(std-mn):
-            p.append(1)
-        else:
-            p.append(0)
-
-        tr=row[2:-1]
-        tr.sort()
-
-        seq=list(tr)
-        if row[-1]>=seq[-4]:
-            sh.append(1)
-
-        if seq[-4]>row[-1]>seq[3]:
-            sh.append(0)
-
-        if row[-1]<=seq[3]:
-            sh.append(-1)
-    Drn1[["yearly_Rain_shock","yearly_Rain_pos_neg_shock"]]=np.array((p,sh)).T
+def get_india_mask(df_grid):
+    """Returns a boolean mask for coordinates within India."""
+    # Rough bounding box for speed before expensive geocoding
+    mask = (df_grid[1] > 6) & (df_grid[1] < 37) & (df_grid[0] > 68) & (df_grid[0] < 97.5)
     
-    return Drn1
+    def check_in(lat, lon):
+        res = rg.search((lat, lon), mode=1)
+        return res[0]['cc'] == 'IN'
 
+    # Only geocode points inside the bounding box
+    india_coords = df_grid[mask].apply(lambda x: check_in(x[1], x[0]), axis=1)
+    return mask & india_coords
 
+# --- Optimized Rain Processing ---
 
-def month_rain(year, mo):
-    lll=[]
-    for i in list(range(year-21, year)):
-        lll.append(str(i)+'_'+mo)
-    Drn2=Dmo[[0,1]+lll]
-    p=[]
-    sh=[]
-    for row in Drn2.values:
-        std=statistics.stdev(row[2:-1])
-        mn=statistics.mean(row[2:-1])
+def calculate_shocks(df, value_cols, prefix):
+    """Vectorized calculation of rain shocks for any timeframe."""
+    data = df[value_cols]
+    current = data.iloc[:, -1]
+    
+    # Stats across the lookback period (excluding current year)
+    lookback = data.iloc[:, :-1]
+    mn = lookback.mean(axis=1)
+    std = lookback.std(axis=1)
+    
+    # Basic Shock
+    df[f'{prefix}_shock'] = ((current < (mn + std)) & (current > (mn - std))).astype(int)
+    
+    # Pos/Neg Shock (based on ranks)
+    # 1 if >= 4th highest, -1 if <= 4th lowest, else 0
+    ranks = data.apply(lambda x: np.sort(x), axis=1)
+    low_bound = ranks.apply(lambda x: x[3])
+    high_bound = ranks.apply(lambda x: x[-4])
+    
+    df[f'{prefix}_pos_neg_shock'] = 0
+    df.loc[current >= high_bound, f'{prefix}_pos_neg_shock'] = 1
+    df.loc[current <= low_bound, f'{prefix}_pos_neg_shock'] = -1
+    
+    return df[[0, 1, f'{prefix}_shock', f'{prefix}_pos_neg_shock']]
 
-        if (std+mn)>row[-1]>(std-mn):
-            p.append(1)
-        else:
-            p.append(0)
+# --- Main Execution ---
 
-        tr=row[2:-1]
-        tr.sort()
+# 1. Initialize Rain DataFrames
+# We load one file to establish the grid
+grid_sample = pd.DataFrame(np.loadtxt(RAIN_PATH / "precip.1997"))
+india_mask = get_india_mask(grid_sample)
 
-        seq=list(tr)
-        if row[-1]>=seq[-4]:
-            sh.append(1)
+dr_annual = grid_sample[india_mask][[0, 1]].copy()
+dr_monthly = grid_sample[india_mask][[0, 1]].copy()
+
+# 2. Single-pass data ingestion
+for year in YEAR_RANGE:
+    data = np.loadtxt(RAIN_PATH / f"precip.{year}")
+    # Annual (sum of all months/cols 2-13)
+    dr_annual[year] = data[india_mask, 2:14].sum(axis=1)
+    
+    # Specific month groups (example logic for your 04, 08, 12 blocks)
+    dr_monthly[f"{year}_04"] = data[india_mask, 2:6].sum(axis=1)
+    dr_monthly[f"{year}_08"] = data[india_mask, 6:10].sum(axis=1)
+    dr_monthly[f"{year}_12"] = data[india_mask, 10:14].sum(axis=1)
+
+# 3. Process CMIE Files
+# Build a KDTree for the rain grid for lightning-fast spatial lookups
+tree = cKDTree(dr_annual[[1, 0]].values) # Lat, Lon
+
+for file in os.listdir(CMIE_PATH):
+    df_cmie = pd.read_csv(CMIE_PATH / file)
+    
+    # Logic to determine target year/month from filename
+    # (Keeping your original logic but cleaned up)
+    raw_year = int(file[19:23])
+    mm = file[32:34]
+    target_year = raw_year + 1 if (raw_year == 2017 and mm == "12") else raw_year
+    
+    # Calculate shocks for this specific year/quarter
+    annual_shocks = calculate_shocks(dr_annual, list(range(target_year-21, target_year+1)), "yearly_Rain")
+    
+    # Spatial Lookup: Find nearest rain grid index for each CMIE row
+    # Assuming city_ltln_D contains [lat, lon]
+    # This replaces the 'closest_rain' loop
+    city_coords = [city_ltln_D.get(f"{row[3]} {row[1]}", [np.nan, np.nan]) for row in df_cmie.values]
+    distances, indices = tree.query(city_coords)
+    
+    # Merge data using indices
+    res_annual = annual_shocks.iloc[indices][['yearly_Rain_shock', 'yearly_Rain_pos_neg_shock']].values
+    
+    # Combine and save
+    df_cmie[['yearly_Rain_shock', 'yearly_Rain_pos_neg_shock']] = res_annual
+    df_cmie.to_csv(f"done_{file}", index=False)            sh.append(1)
 
         if seq[-4]>row[-1]>seq[3]:
             sh.append(0)
